@@ -29,7 +29,7 @@ MODELS_URL = BASE + '/v1/models'
 MODEL = os.environ.get('SURVIVAL_MODEL', 'deepseek-v4.1-flash')
 # Some servers' thinking models (Ollama's gemma4) spend a whole round's tokens thinking at 'low'; 'none' answers straight away.
 REASONING_EFFORT = os.environ.get('SURVIVAL_REASONING_EFFORT', 'low')
-MAX_ROUNDS = 2  # tool rounds; then the model must answer with what it has
+MAX_ROUNDS = int(os.environ.get('SURVIVAL_MAX_ROUNDS', '2'))  # tool rounds; then the model must answer with what it has
 S = None        # server module, set by init()
 INDEX = None    # retrieval.Index
 # The optional local AI (llm_local.py): on in the desktop app, off in the server version unless LASTBOOK_LOCAL_AI=1.
@@ -392,17 +392,73 @@ GROUPED = re.compile(r'\[\s*[SM]\d+(?:\s*[,;]\s*[SM]\d+)+\s*\]')   # how Gemma o
 # The local model has no image input, so it is not told about view_page.
 SYSTEM_TEXT_ONLY = SYSTEM.replace(', view_page when a diagram or table matters', '').replace(
     'scanned pages without text (unless you view the page image)', 'pictures, diagrams or scanned pages without text')
-ROUND_TOKENS = 1800
+ROUND_TOKENS = int(os.environ.get('SURVIVAL_ROUND_TOKENS', '1800'))
+# Inkling and other thinking models sometimes leak reasoning or tool markup into the written answer.
+_THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
+_TOOL_MARKUP_RE = re.compile(
+    r'<\|tool_call\|>.*?(?:<\|tool_call_end\|>|<\|/tool_call\|>)|'
+    r'<tool_call>.*?</tool_call>',
+    re.DOTALL | re.IGNORECASE,
+)
 
 
-def _http_round(msgs, tools, cancelled, wrote, set_state):
-    """One model turn from the model server at BASE. (content, {index: call}), 'stopped', or a sentence saying what failed."""
+def _clean_final_text(text):
+    """Drop leaked thinking / tool-call markup so the person sees a written answer."""
+    text = _THINK_RE.sub('', text or '')
+    text = _TOOL_MARKUP_RE.sub('', text)
+    return text.strip()
+
+
+def _answer_from_sources(sess):
+    """Short fallback when the model spent its budget without writing: quote retrieved passages."""
+    lines = []
+    for k, s in sess.sources.items():
+        excerpt = re.sub(r'\s+', ' ', (s.get('excerpt') or '')).strip()
+        if not excerpt:
+            continue
+        title = s.get('title') or 'Source'
+        lines.append(f'- {excerpt[:400]} [{k}] ({title})')
+        if len(lines) >= 5:
+            break
+    if not lines:
+        return ''
+    return 'From the library passages retrieved for this question:\n\n' + '\n\n'.join(lines)
+
+
+def _http_round(msgs, tools, cancelled, wrote, set_state, final=False):
+    """One model turn from the model server at BASE. (content, {index: call}), 'stopped', or a sentence saying what failed.
+
+    On the final no-tools round, prefill an empty assistant turn with vLLM's continue_final_message so thinking
+    models (Inkling) write an answer instead of calling tools again. If the server rejects those params (HTTP 400),
+    retry once without them so llama.cpp / Gemma runners keep working.
+    """
     body = {'model': MODEL, 'messages': msgs, 'stream': True, 'temperature': 0.2, 'max_tokens': ROUND_TOKENS, 'reasoning_effort': REASONING_EFFORT}
     if tools:
         body['tools'] = tools
+    prefill = bool(final and not tools)
+    if prefill:
+        body['messages'] = msgs + [{'role': 'assistant', 'content': ''}]
+        body['continue_final_message'] = True
+        body['add_generation_prompt'] = False
     req = urllib.request.Request(MODEL_URL, json.dumps(body).encode(), {'Content-Type': 'application/json'})
     try:
         resp = model_open(req, timeout=180)
+    except urllib.error.HTTPError as e:
+        try:
+            e.close()
+        except Exception:
+            pass
+        if not (prefill and e.code == 400):
+            return f'The local model is not responding ({type(e).__name__}).'
+        # Server rejected vLLM-only params; retry without prefill so other backends still work.
+        body.pop('continue_final_message', None)
+        body.pop('add_generation_prompt', None)
+        body['messages'] = msgs
+        req = urllib.request.Request(MODEL_URL, json.dumps(body).encode(), {'Content-Type': 'application/json'})
+        try:
+            resp = model_open(req, timeout=180)
+        except Exception as e2:
+            return f'The local model is not responding ({type(e2).__name__}).'
     except Exception as e:
         return f'The local model is not responding ({type(e).__name__}).'
     calls, content = {}, ''
@@ -551,7 +607,10 @@ def chat(messages, about, emit, cancelled):
         if last:
             msgs.append({'role': 'system', 'content': 'Stop searching now. Write the answer using only the sources already retrieved, with their keys. If they are not enough, say what is missing under "Not found in the library:".'})
         set_state('thinking' if rnd == 0 else 'reading')
-        got = (_local_round if local else _http_round)(msgs, None if last else tools, cancelled, wrote, set_state)
+        if local:
+            got = _local_round(msgs, None if last else tools, cancelled, wrote, set_state)
+        else:
+            got = _http_round(msgs, None if last else tools, cancelled, wrote, set_state, final=last)
         if got in ('stopped', None):
             emit({'type': 'stopped'} if got else {'type': 'error', 'error': 'model_unavailable', 'text': 'The local model stopped responding.'})
             return
@@ -559,6 +618,9 @@ def chat(messages, about, emit, cancelled):
             emit({'type': 'error', 'error': 'model_unavailable', 'text': got})
             return
         content, calls = got
+        if last:
+            content = _clean_final_text(content)
+            calls = {}  # final round has no tools: ignore any leaked structured calls
         rf = first['at']
         if not calls:
             answer = content
@@ -590,9 +652,13 @@ def chat(messages, about, emit, cancelled):
         if content:  # text written before tool calls is discarded from the final answer
             emit({'type': 'reset'})
     if not answer.strip():
-        emit({'type': 'error', 'error': 'empty', 'text': 'The model did not produce an answer. The passages it found are listed below.',
-              'sources': list(sess.sources.values())})
-        return
+        answer = _answer_from_sources(sess)
+        if answer:
+            wrote(answer)
+        else:
+            emit({'type': 'error', 'error': 'empty', 'text': 'The model did not produce an answer. The passages it found are listed below.',
+                  'sources': list(sess.sources.values())})
+            return
     # Validate citations against what the tools actually returned in this turn.
     answer = GROUPED.sub(lambda m: ''.join(f'[{k}]' for k in re.findall(r'[SM]\d+', m.group(0))), answer)   # [S3, S4] -> [S3][S4]
     used = CITE.findall(answer)
